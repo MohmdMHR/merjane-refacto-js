@@ -1,11 +1,13 @@
 /* eslint-disable @typescript-eslint/switch-exhaustiveness-check */
-/* eslint-disable max-depth */
+
 /* eslint-disable no-await-in-loop */
 import {eq} from 'drizzle-orm';
 import fastifyPlugin from 'fastify-plugin';
 import {serializerCompiler, validatorCompiler, type ZodTypeProvider} from 'fastify-type-provider-zod';
 import {z} from 'zod';
-import {orders, products} from '@/db/schema.js';
+import {orders, products, type Product} from '@/db/schema.js';
+import type {Database} from '@/db/type.ts';
+import type {INotificationService} from '@/services/notifications.port.ts';
 
 export const myController = fastifyPlugin(async server => {
 	// Add schema validator and serializer
@@ -20,7 +22,7 @@ export const myController = fastifyPlugin(async server => {
 		},
 	}, async (request, reply) => {
 		const dbse = server.diContainer.resolve('db');
-		const ps = server.diContainer.resolve('ps');
+		const ps = server.diContainer.resolve('ns')  as INotificationService;
 		const order = (await dbse.query.orders
 			.findFirst({
 				where: eq(orders.id, request.params.orderId),
@@ -33,48 +35,23 @@ export const myController = fastifyPlugin(async server => {
 					},
 				},
 			}))!;
-		console.log(order);
-		const ids: number[] = [request.params.orderId];
 		const {products: productList} = order;
 
 		if (productList) {
-			for (const {product: p} of productList) {
-				switch (p.type) {
+			for (const {product} of productList) {
+				switch (product.type) {
 					case 'NORMAL': {
-						if (p.available > 0) {
-							p.available -= 1;
-							await dbse.update(products).set(p).where(eq(products.id, p.id));
-						} else {
-							const {leadTime} = p;
-							if (leadTime > 0) {
-								await ps.notifyDelay(leadTime, p);
-							}
-						}
-
+						await processNormalProduct(product, dbse, ps);
 						break;
 					}
 
 					case 'SEASONAL': {
-						const currentDate = new Date();
-						if (currentDate > p.seasonStartDate! && currentDate < p.seasonEndDate! && p.available > 0) {
-							p.available -= 1;
-							await dbse.update(products).set(p).where(eq(products.id, p.id));
-						} else {
-							await ps.handleSeasonalProduct(p);
-						}
-
+						await processSeasonalProduct(product, dbse, ps);
 						break;
 					}
 
 					case 'EXPIRABLE': {
-						const currentDate = new Date();
-						if (p.available > 0 && p.expiryDate! > currentDate) {
-							p.available -= 1;
-							await dbse.update(products).set(p).where(eq(products.id, p.id));
-						} else {
-							await ps.handleExpiredProduct(p);
-						}
-
+						await processExpirableProduct(product, dbse, ps);
 						break;
 					}
 				}
@@ -83,5 +60,47 @@ export const myController = fastifyPlugin(async server => {
 
 		await reply.send({orderId: order.id});
 	});
+
+	async function processNormalProduct(product: Product, database: Database, ps: INotificationService): Promise<void> {
+		if (product.available > 0) {
+			product.available -= 1;
+			await database.update(products).set(product).where(eq(products.id, product.id));
+		} else {
+			const {leadTime} = product;
+			if (leadTime > 0) {
+				ps.sendDelayNotification(product.leadTime, product.name);
+			}
+		}
+	}
+
+	async function processSeasonalProduct(product: Product, database: Database, ps: INotificationService): Promise<void> {
+		const currentDate = new Date();
+
+		const isInSeason
+			= currentDate > (product.seasonStartDate!)
+			&& currentDate < (product.seasonEndDate!);
+
+		if (isInSeason && product.available > 0) {
+			product.available -= 1;
+			await database.update(products).set(product).where(eq(products.id, product.id));
+		} else {
+			ps.sendOutOfStockNotification(product.name);
+		}
+	}
+
+	async function processExpirableProduct(product: Product, database: Database, ps: INotificationService): Promise<void> {
+		const currentDate = new Date();
+
+		const isValid
+			= product.available > 0
+			&& (product.expiryDate!) > currentDate;
+
+		if (isValid) {
+			product.available -= 1;
+			await database.update(products).set(product).where(eq(products.id, product.id));
+		} else {
+			ps.sendExpirationNotification(product.name, product.expiryDate!);
+		}
+	}
 });
 

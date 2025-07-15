@@ -52,6 +52,29 @@ describe('MyController Integration Tests', () => {
 		expect(resultOrder!.id).toBe(orderId);
 	});
 
+	it('should decrement available for in-stock NORMAL product and leave others untouched', async () => {
+		const client = supertest(fastify.server);
+
+		const productToTrack = {
+			leadTime: 5,
+			available: 1,
+			type: 'NORMAL',
+			name: 'Test Mouse',
+		};
+
+		const [orderId, trackedProductId] = await database.transaction(async tx => {
+			const [insertedProduct] = await tx.insert(products).values([productToTrack]).returning({id: products.id});
+			const [order] = await tx.insert(orders).values([{}]).returning({orderId: orders.id});
+			await tx.insert(ordersToProducts).values([{orderId: order!.orderId, productId: insertedProduct!.id}]);
+			return [order!.orderId, insertedProduct!.id];
+		});
+
+		await client.post(`/orders/${orderId}/processOrder`).expect(200);
+
+		const updated = await database.query.products.findFirst({where: eq(products.id, trackedProductId)});
+		expect(updated!.available).toBe(0);
+	});
+
 	function createProducts(): ProductInsert[] {
 		const d = 24 * 60 * 60 * 1000;
 		return [
